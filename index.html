@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Spotify Playlist Manager</title>
+  <style>
+    :root { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color-scheme: dark; }
+    body { margin:0; background:#121212; color:#fff; }
+    main { max-width:760px; margin:auto; padding:24px 16px 48px; }
+    h1 { margin:0 0 8px; font-size:28px; }
+    h2 { font-size:20px; margin-top:28px; }
+    .muted { color:#b3b3b3; }
+    .card { background:#1e1e1e; border-radius:14px; padding:18px; margin:14px 0; }
+    input, textarea, select, button {
+      width:100%; box-sizing:border-box; border-radius:8px; border:1px solid #444;
+      padding:12px; margin:7px 0; font:inherit;
+    }
+    input, textarea, select { background:#2a2a2a; color:#fff; }
+    button { background:#1db954; color:#000; border:0; font-weight:700; cursor:pointer; }
+    button.secondary { background:#333; color:#fff; }
+    button.danger { background:#8b1e1e; color:#fff; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .status { white-space:pre-wrap; background:#101010; padding:12px; border-radius:8px; color:#ddd; }
+    .track { display:flex; gap:10px; align-items:center; padding:10px 0; border-bottom:1px solid #333; }
+    .track:last-child { border-bottom:0; }
+    .track img { width:48px; height:48px; border-radius:5px; object-fit:cover; }
+    .track-main { min-width:0; flex:1; }
+    .track-name { font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .track-artist { color:#aaa; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .small { font-size:13px; }
+    code { background:#2a2a2a; padding:2px 5px; border-radius:4px; }
+    a { color:#1db954; }
+    .hidden { display:none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Spotify Playlist Manager</h1>
+  <p class="muted">Lokale/kleine Web-App für dein eigenes Spotify-Konto. OAuth läuft über PKCE; dein Client Secret wird nicht benötigt.</p>
+
+  <section class="card">
+    <h2>1. Spotify-App verbinden</h2>
+    <label>Client ID</label>
+    <input id="clientId" placeholder="Deine Spotify Client ID" autocomplete="off">
+    <p class="small muted">Die Client ID ist keine geheime Zugangsinformation. Niemals ein Client Secret, Access Token oder Refresh Token hier veröffentlichen.</p>
+    <p class="small">Diese Seite muss unter einer HTTPS-Adresse laufen. Trage genau diese aktuelle Adresse als Redirect URI in deiner Spotify-App ein:</p>
+    <code id="redirectUri"></code>
+    <button id="loginBtn">Mit Spotify verbinden</button>
+    <button id="logoutBtn" class="secondary hidden">Verbindung lokal löschen</button>
+  </section>
+
+  <section id="app" class="hidden">
+    <div class="card">
+      <h2>2. Konto</h2>
+      <div id="profile" class="status">Noch nicht geladen.</div>
+      <button id="loadPlaylistsBtn" class="secondary">Meine Playlists laden</button>
+      <select id="playlistSelect"><option value="">Playlist auswählen</option></select>
+    </div>
+
+    <div class="card">
+      <h2>3. Neue Playlist</h2>
+      <input id="playlistName" placeholder="z. B. Night Drive">
+      <textarea id="playlistDescription" rows="3" placeholder="Beschreibung (optional)"></textarea>
+      <select id="playlistPublic">
+        <option value="false">Privat</option>
+        <option value="true">Öffentlich</option>
+      </select>
+      <button id="createPlaylistBtn">Playlist erstellen</button>
+    </div>
+
+    <div class="card">
+      <h2>4. Songs suchen und zur ausgewählten Playlist hinzufügen</h2>
+      <input id="searchInput" placeholder="Song, Artist oder Album">
+      <button id="searchBtn" class="secondary">Suchen</button>
+      <div id="results"></div>
+    </div>
+
+    <div class="card">
+      <h2>5. Status</h2>
+      <div id="status" class="status">Bereit.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const AUTH = "https://accounts.spotify.com";
+  const API = "https://api.spotify.com/v1";
+  const REDIRECT_URI = window.location.href.split("#")[0].split("?")[0];
+
+  const scopes = [
+    "playlist-read-private",
+    "playlist-read-collaborative",
+    "playlist-modify-private",
+    "playlist-modify-public"
+  ].join(" ");
+
+  const $ = id => document.getElementById(id);
+  $("redirectUri").textContent = REDIRECT_URI;
+
+  let accessToken = localStorage.getItem("sp_access_token") || "";
+  let refreshToken = localStorage.getItem("sp_refresh_token") || "";
+  let expiresAt = Number(localStorage.getItem("sp_expires_at") || 0);
+  let currentPlaylistId = "";
+
+  function randomString(length=64) {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    const bytes = new Uint8Array(length);
+    crypto.getRandomValues(bytes);
+    return [...bytes].map(b => chars[b % chars.length]).join("");
+  }
+
+  async function sha256Base64Url(input) {
+    const data = new TextEncoder().encode(input);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    const bytes = new Uint8Array(digest);
+    let binary = "";
+    bytes.forEach(b => binary += String.fromCharCode(b));
+    return btoa(binary).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  }
+
+  function setStatus(msg) { $("status").textContent = msg; }
+
+  async function beginLogin() {
+    const clientId = $("clientId").value.trim();
+    if (!clientId) return alert("Bitte zuerst die Client ID eintragen.");
+    localStorage.setItem("sp_client_id", clientId);
+
+    const verifier = randomString(96);
+    const challenge = await sha256Base64Url(verifier);
+    const state = randomString(32);
+    localStorage.setItem("sp_code_verifier", verifier);
+    localStorage.setItem("sp_state", state);
+
+    const params = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      scope: scopes,
+      redirect_uri: REDIRECT_URI,
+      state,
+      code_challenge_method: "S256",
+      code_challenge: challenge
+    });
+    window.location.href = AUTH + "/authorize?" + params.toString();
+  }
+
+  async function exchangeCode(code) {
+    const clientId = localStorage.getItem("sp_client_id");
+    const verifier = localStorage.getItem("sp_code_verifier");
+    const response = await fetch(AUTH + "/api/token", {
+      method: "POST",
+      headers: {"Content-Type":"application/x-www-form-urlencoded"},
+      body: new URLSearchParams({
+        client_id: clientId,
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: verifier
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error_description || data.error || "Token-Austausch fehlgeschlagen.");
+    saveTokens(data);
+    history.replaceState({}, "", REDIRECT_URI);
+  }
+
+  function saveTokens(data) {
+    accessToken = data.access_token;
+    refreshToken = data.refresh_token || refreshToken;
+    expiresAt = Date.now() + (Number(data.expires_in || 3600) * 1000) - 60000;
+    localStorage.setItem("sp_access_token", accessToken);
+    if (refreshToken) localStorage.setItem("sp_refresh_token", refreshToken);
+    localStorage.setItem("sp_expires_at", String(expiresAt));
+  }
+
+  async function refreshAccessToken() {
+    const clientId = localStorage.getItem("sp_client_id");
+    if (!refreshToken || !clientId) throw new Error("Keine Refresh-Information vorhanden.");
+    const response = await fetch(AUTH + "/api/token", {
+      method: "POST",
+      headers: {"Content-Type":"application/x-www-form-urlencoded"},
+      body: new URLSearchParams({
+        client_id: clientId,
+        grant_type: "refresh_token",
+        refresh_token: refreshToken
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      clearAuth();
+      throw new Error(data.error_description || data.error || "Token-Erneuerung fehlgeschlagen. Bitte neu verbinden.");
+    }
+    saveTokens(data);
+  }
+
+  async function api(path, options={}) {
+    if (!accessToken) throw new Error("Nicht mit Spotify verbunden.");
+    if (Date.now() >= expiresAt) await refreshAccessToken();
+
+    const headers = Object.assign({"Authorization":"Bearer " + accessToken}, options.headers || {});
+    let response = await fetch(API + path, Object.assign({}, options, {headers}));
+    if (response.status === 401 && refreshToken) {
+      await refreshAccessToken();
+      headers.Authorization = "Bearer " + accessToken;
+      response = await fetch(API + path, Object.assign({}, options, {headers}));
+    }
+    const text = await response.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch {}
+    if (!response.ok) {
+      throw new Error(data?.error?.message || data?.message || `Spotify API Fehler ${response.status}`);
+    }
+    return data;
+  }
+
+  async function loadProfile() {
+    const me = await api("/me");
+    $("profile").textContent = "Verbunden als: " + (me.display_name || "Spotify-Nutzer");
+  }
+
+  async function loadPlaylists() {
+    setStatus("Playlists werden geladen …");
+    const select = $("playlistSelect");
+    select.innerHTML = '<option value="">Playlist auswählen</option>';
+    let offset = 0;
+    while (true) {
+      const data = await api(`/me/playlists?limit=50&offset=${offset}`);
+      for (const p of (data.items || [])) {
+        const option = document.createElement("option");
+        option.value = p.id;
+        option.textContent = p.name + (p.owner?.display_name ? " — " + p.owner.display_name : "");
+        select.appendChild(option);
+      }
+      if (!data.next) break;
+      offset += data.limit || 50;
+    }
+    setStatus("Playlists geladen.");
+  }
+
+  async function createPlaylist() {
+    const name = $("playlistName").value.trim();
+    if (!name) return alert("Bitte einen Namen eingeben.");
+    const isPublic = $("playlistPublic").value === "true";
+    const body = {
+      name,
+      public: isPublic,
+      collaborative: false,
+      description: $("playlistDescription").value.trim()
+    };
+    const p = await api("/me/playlists", {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    await loadPlaylists();
+    $("playlistSelect").value = p.id;
+    currentPlaylistId = p.id;
+    setStatus(`Playlist „${p.name}“ erstellt.`);
+  }
+
+  async function searchTracks() {
+    const q = $("searchInput").value.trim();
+    if (!q) return;
+    const data = await api("/search?type=track&limit=10&q=" + encodeURIComponent(q));
+    const box = $("results");
+    box.innerHTML = "";
+    for (const t of (data.tracks?.items || [])) {
+      const row = document.createElement("div");
+      row.className = "track";
+      const img = document.createElement("img");
+      img.src = t.album?.images?.[2]?.url || t.album?.images?.[0]?.url || "";
+      const main = document.createElement("div");
+      main.className = "track-main";
+      main.innerHTML = `<div class="track-name"></div><div class="track-artist"></div>`;
+      main.querySelector(".track-name").textContent = t.name;
+      main.querySelector(".track-artist").textContent = (t.artists || []).map(a => a.name).join(", ");
+      const btn = document.createElement("button");
+      btn.className = "secondary";
+      btn.style.width = "auto";
+      btn.textContent = "Hinzufügen";
+      btn.onclick = () => addTrack(t.uri);
+      row.append(img, main, btn);
+      box.appendChild(row);
+    }
+    setStatus(`${data.tracks?.items?.length || 0} Treffer.`);
+  }
+
+  async function addTrack(uri) {
+    const playlistId = $("playlistSelect").value;
+    if (!playlistId) return alert("Bitte zuerst eine Playlist auswählen.");
+    await api(`/playlists/${encodeURIComponent(playlistId)}/items`, {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({uris:[uri]})
+    });
+    setStatus("Song zur Playlist hinzugefügt.");
+  }
+
+  function clearAuth() {
+    ["sp_access_token","sp_refresh_token","sp_expires_at","sp_code_verifier","sp_state"].forEach(k => localStorage.removeItem(k));
+    accessToken = refreshToken = "";
+    expiresAt = 0;
+    $("app").classList.add("hidden");
+    $("logoutBtn").classList.add("hidden");
+  }
+
+  async function init() {
+    const savedClient = localStorage.getItem("sp_client_id");
+    if (savedClient) $("clientId").value = savedClient;
+
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state");
+    const error = params.get("error");
+
+    try {
+      if (error) throw new Error("Spotify hat die Autorisierung abgelehnt: " + error);
+      if (code) {
+        const expected = localStorage.getItem("sp_state");
+        if (!expected || state !== expected) throw new Error("OAuth-State stimmt nicht überein.");
+        await exchangeCode(code);
+      }
+      if (accessToken) {
+        $("app").classList.remove("hidden");
+        $("logoutBtn").classList.remove("hidden");
+        await loadProfile();
+      }
+    } catch (e) {
+      setStatus(e.message);
+      alert(e.message);
+    }
+  }
+
+  $("loginBtn").onclick = beginLogin;
+  $("logoutBtn").onclick = clearAuth;
+  $("loadPlaylistsBtn").onclick = () => loadPlaylists().catch(e => setStatus(e.message));
+  $("createPlaylistBtn").onclick = () => createPlaylist().catch(e => setStatus(e.message));
+  $("searchBtn").onclick = () => searchTracks().catch(e => setStatus(e.message));
+  $("searchInput").addEventListener("keydown", e => { if (e.key === "Enter") $("searchBtn").click(); });
+  $("playlistSelect").onchange = e => currentPlaylistId = e.target.value;
+
+  init();
+})();
+</script>
+</body>
+</html>
